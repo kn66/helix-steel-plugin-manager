@@ -10,7 +10,7 @@ A small plugin manager for Helix's Steel/Scheme configuration. It clones git rep
 
 ## Installation
 
-The most reliable path is the bundled POSIX `sh` installer. With `--configure`, it installs `plugin-manager.scm` and appends the required blocks to `helix.scm` and `init.scm`. Existing installer-managed blocks are not duplicated.
+The most reliable path is the bundled POSIX `sh` installer. With `--configure`, it installs `plugin-manager.scm` and writes the required managed blocks to `helix.scm` and `init.scm`. Existing installer-managed blocks are updated in place instead of duplicated.
 
 ```sh
 cd "$HOME/src/helix/helix-steel-plugin-manager"
@@ -56,6 +56,9 @@ Expose the commands from `helix.scm`.
 ```scheme
 (require (only-in "helix/plugin-manager.scm"
                   plugin-install
+                  plugin-manager-init
+                  plugin-manager-update
+                  plugin-ensure
                   plugin-update
                   plugin-remove
                   plugin-enable
@@ -65,6 +68,9 @@ Expose the commands from `helix.scm`.
                   plugin-list))
 
 (provide plugin-install
+         plugin-manager-init
+         plugin-manager-update
+         plugin-ensure
          plugin-update
          plugin-remove
          plugin-enable
@@ -77,8 +83,22 @@ Expose the commands from `helix.scm`.
 Load enabled plugins from `init.scm`.
 
 ```scheme
-(require (only-in "helix/plugin-manager.scm" plugin-load-all))
-(plugin-load-all)
+(require (only-in "helix/plugin-manager.scm" plugin-manager-init))
+(plugin-manager-init)
+```
+
+To keep startup plugin declarations compact, use `plugin-ensure`. The plugin
+name is derived from the GitHub shorthand or git URL, and the entry file is
+detected automatically.
+
+```scheme
+(require (only-in "helix/plugin-manager.scm"
+                  plugin-ensure
+                  plugin-manager-init))
+
+(plugin-ensure "kn66/markdown-planner")
+(plugin-ensure "kn66/helix-dired")
+(plugin-manager-init)
 ```
 
 Restart Helix or reload the Steel configuration after installation.
@@ -95,12 +115,14 @@ Helix Steel reads configuration from the Helix config directory. By default, thi
 
 `helix.scm` exposes Scheme functions as Helix commands. The installer adds the plugin manager functions there so commands such as `:plugin-install` and `:plugin-list` are available from Helix's command line.
 
-`init.scm` runs when the Steel configuration is initialized. The installer adds this block so previously installed and enabled plugins are loaded automatically:
+`init.scm` runs when the Steel configuration is initialized. The installer adds this short block so previously installed and enabled plugins are loaded automatically:
 
 ```scheme
-(require (only-in "helix/plugin-manager.scm" plugin-load-all))
-(plugin-load-all)
+(require (only-in "helix/plugin-manager.scm" plugin-manager-init))
+(plugin-manager-init)
 ```
+
+`plugin-manager-init` wraps startup loading and reports plugin load failures as a Helix warning instead of making `init.scm` harder to read.
 
 If `HELIX_STEEL_CONFIG` is set, Helix Steel uses that directory instead of the default config directory. In that case, write `helix.scm`, `init.scm`, and the `helix/plugin-manager.scm` module under `$HELIX_STEEL_CONFIG`.
 
@@ -127,17 +149,34 @@ After exposing the functions from `helix.scm`, you can use them from Helix's com
 ```text
 :plugin-install owner/repo
 :plugin-list
+:plugin-ensure owner/repo
 :plugin-update
+:plugin-manager-update
 :plugin-load repo
 :plugin-disable repo
 :plugin-enable repo
 :plugin-remove repo
 ```
 
-When `plugin-update` finds local changes in a plugin checkout, it opens a
-confirmation prompt before running `git pull`. Type `y` to run
-`git reset --hard` and `git clean -fd` for that plugin checkout, then update.
-Press Enter or type `n` to keep the local changes and skip the update.
+When `plugin-update` finds local changes in a plugin checkout, it keeps those
+changes and prints the command to run if you want to discard them. Use
+`:plugin-update <name> discard` to run `git reset --hard`, `git clean -fd`, and
+then update that checkout.
+
+`plugin-install` is idempotent for the same plugin name and source. If the plugin is already registered and its checkout exists, it reloads the plugin and returns `already installed <name>` instead of cloning again. If the checkout exists but the registry entry is missing, it registers that checkout and loads it.
+
+`plugin-ensure` wraps `plugin-install` for startup use. It accepts the same
+optional arguments, but most plugins only need `(plugin-ensure "owner/repo")`.
+Install failures are reported as Helix warnings so one unavailable plugin does
+not stop the rest of `init.scm`.
+
+Update the plugin manager itself from Helix with:
+
+```text
+:plugin-manager-update
+```
+
+The installer writes the manager source checkout path to `helix/plugin-manager-source`, so `plugin-manager-update` can run `git pull --ff-only` in that checkout. Symlink installs pick up the new file immediately after restart or Steel reload. Copy installs are refreshed by copying the updated `plugin-manager.scm` into the Helix config directory.
 
 ## Plugin Format
 
@@ -185,10 +224,11 @@ git add README.md plugin-manager.scm install.sh
 git commit -m "Initial plugin manager"
 ```
 
-When `plugin-manager.scm` changes, an existing symlink-based install picks up the update after Helix is restarted or the Steel configuration is reloaded. Copy-based installs need to rerun `sh install.sh --copy`.
+When `plugin-manager.scm` changes, run `:plugin-manager-update` from Helix or run `git pull --ff-only` in this repository and rerun `sh install.sh --configure`. Symlink-based installs pick up the updated file after Helix is restarted or the Steel configuration is reloaded. Copy-based installs are refreshed by `:plugin-manager-update` when the installer metadata is present, or by rerunning `sh install.sh --configure --copy`.
 
 ## Notes
 
 - `plugin-disable` only excludes the plugin from future `plugin-load-all` calls. It does not unload definitions already evaluated in the current Steel engine.
-- `plugin-update` runs `git pull --ff-only`. Plugins with local changes prompt before update.
+- `plugin-update` runs `git pull --ff-only`. Plugins with local changes are kept unless you pass `discard`.
+- `plugin-manager-update` runs `git pull --ff-only` for the plugin manager checkout. If that checkout has local changes, use `:plugin-manager-update discard` to reset them before updating.
 - `plugin-remove` deletes the cloned directory by default.

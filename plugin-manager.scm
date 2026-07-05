@@ -7,6 +7,9 @@
 (provide plugin-root
          plugin-registry-path
          plugin-registry
+         plugin-manager-init
+         plugin-manager-update
+         plugin-ensure
          plugin-list
          plugin-install
          plugin-update
@@ -38,6 +41,12 @@
 (define (plugin-registry-path)
   (path-join (plugin-root) "registry.scm"))
 
+(define (plugin-manager-installed-path)
+  (path-join (config-root) "helix" "plugin-manager.scm"))
+
+(define (plugin-manager-source-path)
+  (path-join (config-root) "helix" "plugin-manager-source"))
+
 (define (ensure-plugin-root!)
   (unless (path-exists? (plugin-root))
     (create-directory! (plugin-root))))
@@ -47,6 +56,11 @@
     (let ([contents (read-port-to-string port)])
       (close-port port)
       contents)))
+
+(define (string->file path contents)
+  (let ([port (open-output-file path #:exists 'truncate)])
+    (display contents port)
+    (close-port port)))
 
 (define (make-plugin name source entry branch enabled?)
   (list name source entry branch enabled?))
@@ -113,10 +127,8 @@
       (last-item (cdr items))))
 
 (define (strip-url-suffixes source)
-  (let* ([no-query (let ([parts (split-once source "?")])
-                     (if parts (car parts) source))]
-         [no-fragment (let ([parts (split-once no-query "#")])
-                        (if parts (car parts) no-query))])
+  (let* ([no-query (car (split-many source "?"))]
+         [no-fragment (car (split-many no-query "#"))])
     (trim-end-matches no-fragment "/")))
 
 (define (derive-plugin-name source)
@@ -185,17 +197,14 @@
            value
            ". Use ask, y, or n"))])))
 
-(define (plugin-update-choice->action choice)
-  (let ([value (if choice (string-downcase (trim choice)) "")])
-    (cond
-      [(or (equal? value "discard") (equal? value "d") (equal? value "yes") (equal? value "y"))
-       "discard"]
-      [(or (equal? value "") (equal? value "cancel") (equal? value "c") (equal? value "no") (equal? value "n"))
-       "cancel"]
-      [else #false])))
-
 (define (plugin-directory plugin)
   (plugin-path (plugin-name plugin)))
+
+(define (plugin-manager-source-directory)
+  (let ([source-path (plugin-manager-source-path)])
+    (if (path-exists? source-path)
+        (trim (file->string source-path))
+        (parent-name (plugin-manager-installed-path)))))
 
 (define (ensure-plugin-directory! directory)
   (unless (path-exists? directory)
@@ -219,34 +228,19 @@
   (run-git (list "reset" "--hard") directory)
   (run-git (list "clean" "-fd") directory))
 
-(define (set-plugin-update-result! thunk)
-  (with-handler
-    (lambda (err)
-      (helix.misc.set-error!
-        (string-append "plugin-update failed: " (to-string err))))
-    (helix.misc.set-status! (thunk))))
-
-(define (open-plugin-update-choice-prompt plugins dirty)
+(define (plugin-update-local-changes-message dirty)
   (let ([names (string-join (map plugin-name dirty) ", ")])
-    (helix.misc.push-component!
-      (prompt
+    (if (= (length dirty) 1)
         (string-append
-          "Local changes in "
+          "local changes in "
           names
-          ". Discard local changes and update? [y/N]: ")
-        (lambda (choice)
-          (let ([action (plugin-update-choice->action choice)])
-            (cond
-              [(equal? action "discard")
-               (set-plugin-update-result!
-                 (lambda () (update-plugins plugins "discard")))]
-              [(equal? action "cancel")
-               (helix.misc.set-warning!
-                 "plugin-update canceled; local changes kept")]
-              [else
-               (helix.misc.set-warning!
-                 "plugin-update canceled; type y or n")])))))
-    (string-append "plugin-update choice opened for " names)))
+          "; run :plugin-update "
+          (plugin-name (car dirty))
+          " discard to reset them before updating")
+        (string-append
+          "local changes in "
+          names
+          "; update each dirty plugin with :plugin-update <name> discard"))))
 
 (define (candidate-entries name)
   (list "helix.scm" "init.scm" "plugin.scm" "cog.scm" (string-append name ".scm")))
@@ -273,6 +267,15 @@
                name
                ".scm"))))]))
 
+(define (resolve-existing-entry plugin-directory plugin requested-entry)
+  (cond
+    [requested-entry
+     (resolve-entry plugin-directory requested-entry (plugin-name plugin))]
+    [(path-exists? (path-join plugin-directory (plugin-entry plugin)))
+     (plugin-entry plugin)]
+    [else
+     (resolve-entry plugin-directory #false (plugin-name plugin))]))
+
 (define (load-plugin-spec plugin)
   (let* ([entry-path (path-join (plugin-path (plugin-name plugin)) (plugin-entry plugin))]
          [require-expression (string-append "(require " (scheme-quote-string entry-path) ")")])
@@ -280,6 +283,22 @@
       (error (string-append "plugin entry not found: " entry-path)))
     (eval-string require-expression)
     (string-append "loaded " (plugin-name plugin))))
+
+(define (install-existing-plugin plugin target entry branch)
+  (let ([resolved-entry (resolve-existing-entry target plugin entry)])
+    (when (and branch (not (equal? branch (plugin-branch plugin))))
+      (error
+        (string-append
+          "plugin already installed with a different branch: "
+          (plugin-name plugin))))
+    (let ([updated (make-plugin (plugin-name plugin)
+                                (plugin-source plugin)
+                                resolved-entry
+                                (plugin-branch plugin)
+                                #true)])
+      (save-registry! (replace-plugin-spec updated (plugin-registry)))
+      (load-plugin-spec updated)
+      (string-append "already installed " (plugin-name plugin)))))
 
 ;;@doc
 ;; Clone a plugin repository and load its entry file.
@@ -290,21 +309,97 @@
 (define (plugin-install source [name #false] [entry #false] [branch #false])
   (let* ([url (normalize-source source)]
          [plugin-name (or name (derive-plugin-name source))]
-         [target (plugin-path plugin-name)])
+         [target (plugin-path plugin-name)]
+         [plugins (plugin-registry)]
+         [existing (find-plugin-spec plugin-name plugins)])
     (assert-valid-plugin-name! plugin-name)
     (ensure-plugin-root!)
-    (when (path-exists? target)
-      (error (string-append "plugin already installed: " plugin-name)))
-    (run-git
-      (append (list "clone")
-              (if branch (list "--branch" branch) '())
-              (list url target))
-      #false)
-    (let* ([resolved-entry (resolve-entry target entry plugin-name)]
-           [plugin (make-plugin plugin-name url resolved-entry branch #true)])
-      (save-registry! (upsert-plugin-spec plugin (plugin-registry)))
-      (load-plugin-spec plugin)
-      (string-append "installed " plugin-name))))
+    (cond
+      [existing
+       (unless (equal? url (plugin-source existing))
+         (error
+           (string-append
+             "plugin already installed with a different source: "
+             plugin-name)))
+       (if (path-exists? target)
+           (install-existing-plugin existing target entry branch)
+           (begin
+             (run-git
+               (append (list "clone")
+                       (if (or branch (plugin-branch existing))
+                           (list "--branch" (or branch (plugin-branch existing)))
+                           '())
+                       (list url target))
+               #false)
+             (install-existing-plugin existing target entry branch)))]
+      [(path-exists? target)
+       (let* ([resolved-entry (resolve-entry target entry plugin-name)]
+              [plugin (make-plugin plugin-name url resolved-entry branch #true)])
+         (save-registry! (upsert-plugin-spec plugin plugins))
+         (load-plugin-spec plugin)
+         (string-append "registered existing " plugin-name))]
+      [else
+       (run-git
+         (append (list "clone")
+                 (if branch (list "--branch" branch) '())
+                 (list url target))
+         #false)
+       (let* ([resolved-entry (resolve-entry target entry plugin-name)]
+              [plugin (make-plugin plugin-name url resolved-entry branch #true)])
+         (save-registry! (upsert-plugin-spec plugin (plugin-registry)))
+         (load-plugin-spec plugin)
+         (string-append "installed " plugin-name))])))
+
+;;@doc
+;; Ensure a plugin is installed and loaded. This is intended for init.scm.
+(define (plugin-ensure source [name #false] [entry #false] [branch #false])
+  (let ([label (if name name source)])
+    (with-handler
+      (lambda (err)
+        (let ([message (string-append "plugin install skipped: " label ": " (to-string err))])
+          (helix.misc.set-warning! message)
+          message))
+      (plugin-install source name entry branch))))
+
+;;@doc
+;; Load enabled plugins. This is the shortest stable entry point for init.scm.
+(define (plugin-manager-init)
+  (with-handler
+    (lambda (err)
+      (let ([message (string-append "plugin-manager init failed: " (to-string err))])
+        (helix.misc.set-warning! message)
+        message))
+    (plugin-load-all)))
+
+;;@doc
+;; Update the plugin manager repository and refresh a copy-based install.
+(define (plugin-manager-update [dirty-action "ask"])
+  (let* ([source-directory (plugin-manager-source-directory)]
+         [source-file (path-join source-directory "plugin-manager.scm")]
+         [target-file (plugin-manager-installed-path)]
+         [action (plugin-update-action dirty-action)])
+    (unless (path-exists? (path-join source-directory ".git"))
+      (error
+        (string-append
+          "plugin manager source is not a git checkout: "
+          source-directory)))
+    (unless (path-exists? source-file)
+      (error (string-append "plugin-manager.scm not found: " source-file)))
+    (if (and (plugin-local-changes? source-directory)
+             (not (equal? action "discard")))
+        (if (equal? action "ask")
+            "plugin manager has local changes; run :plugin-manager-update discard to reset them"
+            "skipped plugin manager update (local changes kept)")
+        (begin
+          (when (equal? action "discard")
+            (discard-plugin-local-changes! source-directory))
+          (run-git (list "pull" "--ff-only") source-directory)
+          (when (not (equal? (file->string source-file) (file->string target-file)))
+            (string->file target-file (file->string source-file)))
+          (string-append
+            "updated plugin manager from "
+            source-directory
+            "; restart Helix or reload Steel configuration to use new definitions")))))
 
 (define (update-plugin-spec plugin [dirty-action "ask"])
   (let* ([directory (plugin-directory plugin)]
@@ -319,7 +414,7 @@
           [(equal? action "cancel")
            (string-append "skipped " (plugin-name plugin) " (local changes kept)")]
           [else
-           (open-plugin-update-choice-prompt (list plugin) (list plugin))])
+           (plugin-update-local-changes-message (list plugin))])
         (begin
           (run-git (list "pull" "--ff-only") directory)
           (string-append "updated " (plugin-name plugin))))))
@@ -342,7 +437,7 @@
             "No plugins installed"
             (let ([dirty (dirty-plugins plugins)])
               (if (and (equal? action "ask") (not (null? dirty)))
-                  (open-plugin-update-choice-prompt plugins dirty)
+                  (plugin-update-local-changes-message dirty)
                   (update-plugins plugins action)))))))
 
 ;;@doc

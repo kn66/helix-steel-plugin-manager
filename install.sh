@@ -93,6 +93,7 @@ fi
 
 module_dir=$config_dir/helix
 target_file=$module_dir/plugin-manager.scm
+source_metadata_file=$module_dir/plugin-manager-source
 helix_scm=$config_dir/helix.scm
 init_scm=$config_dir/init.scm
 
@@ -121,6 +122,8 @@ install_module() {
 
     if [ -f "$target_file" ] && cmp -s "$source_file" "$target_file"; then
         printf 'plugin-manager.scm is already installed at %s\n' "$target_file"
+        printf '%s\n' "$script_dir" > "$source_metadata_file" ||
+            die "failed to write $source_metadata_file"
         return 0
     fi
 
@@ -129,6 +132,8 @@ install_module() {
        command -v readlink >/dev/null 2>&1 &&
        [ "$(readlink "$target_file")" = "$source_file" ]; then
         printf 'plugin-manager.scm symlink is already installed at %s\n' "$target_file"
+        printf '%s\n' "$script_dir" > "$source_metadata_file" ||
+            die "failed to write $source_metadata_file"
         return 0
     fi
 
@@ -138,6 +143,8 @@ install_module() {
         cp -p "$source_file" "$target_file" ||
             die "failed to copy plugin-manager.scm"
         printf 'Copied plugin-manager.scm to %s\n' "$target_file"
+        printf '%s\n' "$script_dir" > "$source_metadata_file" ||
+            die "failed to write $source_metadata_file"
         return 0
     fi
 
@@ -149,6 +156,9 @@ install_module() {
             die "failed to copy plugin-manager.scm"
         printf 'Copied plugin-manager.scm to %s\n' "$target_file"
     fi
+
+    printf '%s\n' "$script_dir" > "$source_metadata_file" ||
+        die "failed to write $source_metadata_file"
 }
 
 marker_state() {
@@ -172,23 +182,60 @@ marker_state() {
     [ "$has_begin" -eq 1 ]
 }
 
+replace_or_append_block() {
+    file=$1
+    begin=$2
+    end=$3
+    block_file=$4
+    label=$5
+
+    if marker_state "$file" "$begin" "$end"; then
+        tmp=${TMPDIR:-/tmp}/helix-steel-plugin-manager.$$.tmp
+        awk -v begin="$begin" -v end="$end" -v block_file="$block_file" '
+            BEGIN {
+                while ((getline line < block_file) > 0) {
+                    block = block line ORS
+                }
+                in_block = 0
+            }
+            index($0, begin) {
+                printf "%s", block
+                in_block = 1
+                next
+            }
+            index($0, end) {
+                in_block = 0
+                next
+            }
+            !in_block {
+                print
+            }
+        ' "$file" > "$tmp" || die "failed to update $file"
+        mv "$tmp" "$file" || die "failed to replace $file"
+        printf 'Updated %s\n' "$file"
+        return 0
+    fi
+
+    cat "$block_file" >> "$file" || die "failed to append $label setup"
+    printf 'Updated %s\n' "$file"
+}
+
 append_helix_config() {
     mkdir -p "$config_dir" || die "failed to create $config_dir"
     [ -f "$helix_scm" ] || : > "$helix_scm"
 
     begin=';; BEGIN helix-steel-plugin-manager'
     end=';; END helix-steel-plugin-manager'
-
-    if marker_state "$helix_scm" "$begin" "$end"; then
-        printf 'helix.scm already contains plugin manager setup\n'
-        return 0
-    fi
+    block_file=${TMPDIR:-/tmp}/helix-steel-plugin-manager.helix.$$.block
 
     {
         printf '\n%s\n' "$begin"
         cat <<'EOF'
 (require (only-in "helix/plugin-manager.scm"
                   plugin-install
+                  plugin-manager-init
+                  plugin-manager-update
+                  plugin-ensure
                   plugin-update
                   plugin-remove
                   plugin-enable
@@ -198,6 +245,9 @@ append_helix_config() {
                   plugin-list))
 
 (provide plugin-install
+         plugin-manager-init
+         plugin-manager-update
+         plugin-ensure
          plugin-update
          plugin-remove
          plugin-enable
@@ -207,9 +257,10 @@ append_helix_config() {
          plugin-list)
 EOF
         printf '%s\n' "$end"
-    } >> "$helix_scm"
+    } > "$block_file"
 
-    printf 'Updated %s\n' "$helix_scm"
+    replace_or_append_block "$helix_scm" "$begin" "$end" "$block_file" "helix.scm"
+    rm -f "$block_file"
 }
 
 append_init_config() {
@@ -218,22 +269,19 @@ append_init_config() {
 
     begin=';; BEGIN helix-steel-plugin-manager'
     end=';; END helix-steel-plugin-manager'
-
-    if marker_state "$init_scm" "$begin" "$end"; then
-        printf 'init.scm already contains plugin manager setup\n'
-        return 0
-    fi
+    block_file=${TMPDIR:-/tmp}/helix-steel-plugin-manager.init.$$.block
 
     {
         printf '\n%s\n' "$begin"
         cat <<'EOF'
-(require (only-in "helix/plugin-manager.scm" plugin-load-all))
-(plugin-load-all)
+(require (only-in "helix/plugin-manager.scm" plugin-manager-init))
+(plugin-manager-init)
 EOF
         printf '%s\n' "$end"
-    } >> "$init_scm"
+    } > "$block_file"
 
-    printf 'Updated %s\n' "$init_scm"
+    replace_or_append_block "$init_scm" "$begin" "$end" "$block_file" "init.scm"
+    rm -f "$block_file"
 }
 
 if ! command -v git >/dev/null 2>&1; then
